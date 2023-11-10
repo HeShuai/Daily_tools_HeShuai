@@ -1,0 +1,73 @@
+
+###---------------------1. Download demo singlecell sequencing data---------------###
+wget http://cf.10xgenomics.com/samples/cell-exp/3.0.0/pbmc_10k_v3/pbmc_10k_v3_filtered_feature_bc_matrix.tar.gz
+tar xvf pbmc_10k_v3_filtered_feature_bc_matrix.tar.gz
+
+###----------------------2. Creat seurat object and perform quality control-----------------------------###
+library(Seurat)
+subset_cells <- Read10X(data.dir = "./filtered_feature_bc_matrix")
+subset_cells <- CreateSeuratObject(subset_cells)
+
+mito.features <- grep(pattern = "^MT-", x = rownames(x = subset_cells), value = TRUE)
+percent.mito <- Matrix::colSums(x = GetAssayData(object = subset_cells, slot = 'counts')[mito.features, ])/Matrix::colSums(x = GetAssayData(object = subset_cells, slot = 'counts'))
+subset_cells[["percent.mito"]] <- percent.mito
+subset_cells <- subset(x = subset_cells, subset = nFeature_RNA >= 500 & nFeature_RNA < 7000 & percent.mito <= 0.20 & nCount_RNA >= 1000 & nCount_RNA <= 70000)
+# TenXdat@meta.data %>% row.names %>% write.table(file = paste0(project, ".RData"), col.names = F ,row.names = F, sep = "\t")
+subset_cells <- subset_cells[, sample(1:10905, 500)] ##sampling 500 cells for demo
+sce_count <- GetAssayData(subset_cells[["RNA"]], slot = "counts")
+write.csv(sce_count, file="sce_count.csv")
+
+###----------------------3.Download new database for SCINEC-----------------###
+###genome ranking database
+wget -c --no-check-certificate https://resources.aertslab.org/cistarget/databases/homo_sapiens/hg38/refseq_r80/mc_v10_clust/gene_based/hg38_10kbp_up_10kbp_down_full_tx_v10_clust.genes_vs_motifs.rankings.feather
+wget -c --no-check-certificate https://resources.aertslab.org/cistarget/databases/homo_sapiens/hg38/refseq_r80/mc_v10_clust/gene_based/hg38_500bp_up_100bp_down_full_tx_v10_clust.genes_vs_motifs.rankings.feather
+
+###motif–TF annotation
+wget -c --no-check-certificate https://resources.aertslab.org/cistarget/motif2tf/motifs-v10nr_clust-nr.hgnc-m0.001-o0.0.tbl
+
+###TF list
+wget -c --no-check-certificate https://resources.aertslab.org/cistarget/tf_lists/allTFs_hg38.txt
+
+###----------------------4.Create conda environment-----------------###
+conda create -y -n pyscenic python=3.10
+conda activate pyscenic
+
+### very important step: re-install numpy 1.23.4
+pip install numpy==1.23.4
+
+###----------------------5.Run pySCENIC-----------------###
+## expression matrix
+f_ex_matrix_csv=/data4/heshuai/tmp/pySCINEC/sce_count.csv
+
+## referrence databases
+f_db_names=$(ls /data/home/heshuai/reference_data/*feather | tr "\n" " ")
+f_motif_path=/data/home/heshuai/reference_data/motifs-v10nr_clust-nr.hgnc-m0.001-o0.0.tbl
+f_tfs=/data/home/heshuai/reference_data/allTFs_hg38.txt
+
+##--------------------Step 1: GENIE3
+pyscenic grn \
+--output adjusted.tsv \
+--method grnboost2 \
+--transpose \
+${f_ex_matrix_csv} \
+${f_tfs} \
+--num_workers 48
+
+##--------------------Step 2: cistarget
+pyscenic ctx adjusted.tsv \
+${f_db_names} \
+--annotations_fname ${f_motif_path} \
+--expression_mtx_fname ${f_ex_matrix_csv} \
+--transpose \
+--output sce_regulon.gmt \
+--mask_dropouts \
+--mode "dask_multiprocessing" \
+--num_workers 40
+
+###--------------------Step 3: aucell
+pyscenic aucell \
+${f_ex_matrix_csv} \
+sce_regulon.gmt \
+--transpose \
+--output sce_regulon_AUC.csv \
+--num_workers 48
